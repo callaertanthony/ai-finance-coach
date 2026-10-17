@@ -412,6 +412,18 @@ def test_annotations_tags_notes_events(ctx):
     assert ctx.post("/annotations/gift-fm0/delete").status_code == 404
 
 
+def test_annotation_same_match_is_updated_in_place(ctx):
+    """Tagging a transaction again replaces the tags of its annotation: a second one behind it would never apply."""
+    first = ctx.post("/annotations", {"tx_keys": ["fm0"], "tags": ["capital"], "note": "kept"}).json()
+    again = ctx.post("/annotations", {"tx_keys": ["fm0"], "tags": ["savings"]}, dry_run=True).json()
+    assert again["id"] == first["id"] and not any("would never apply" in w for w in again["warnings"])
+    assert ctx.post("/annotations", {"tx_keys": ["fm0"], "tags": ["savings"]}).json()["id"] == first["id"]
+    ann = [a for a in ctx.get("/annotations").json()["annotations"] if a["id"].startswith(first["id"])]
+    assert [a["id"] for a in ann] == [first["id"]] and ann[0]["tags"] == ["savings"] and ann[0]["note"] == "kept"
+    assert [i["tx_key"] for i in ctx.get("/transactions", tag="savings").json()["items"]] == ["fm0"]
+    assert "fm0" not in [i["tx_key"] for i in ctx.get("/transactions", tag="capital").json()["items"]]
+
+
 def test_split_and_clear(ctx):
     ok = ctx.post("/transactions/split", {"tx_key": "fm0", "parts": [{"category": "food.groceries", "amount": "15"}, {"category": "household.nope", "amount": "rest"}]})
     assert ok.status_code == 400
