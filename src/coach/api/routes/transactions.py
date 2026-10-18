@@ -241,6 +241,15 @@ def key_regex(key: str) -> str:
     return "^" + re.escape(key).replace("\\ ", " ") + "$"
 
 
+def _same_match(annotations: list, match: dict):
+    """The annotation whose match is exactly `match` (same transactions or same merchant key, no other criterion), or None."""
+    for a in annotations:
+        m = {k: v for k, v in a.match.model_dump(mode="python").items() if v is not None}
+        if m.keys() == match.keys() and all(set(m[k]) == set(v) if k == "tx_keys" else m[k] == v for k, v in match.items()):
+            return a
+    return None
+
+
 def _annotation_parts(state: AppState, req: AnnotationRequest):
     """-> (annotation model, ops, id). Validated by the schema; the store adds the semantic checks when it edits."""
     store = state.store
@@ -268,6 +277,19 @@ def _annotation_parts(state: AppState, req: AnnotationRequest):
         ann["event"] = req.event
     if req.note:
         ann["note"] = req.note
+    same = None if req.id else _same_match(store.annotations(), match)
+    if same is not None:
+        # first match wins: a second annotation with the same match would never apply, so the fields given replace the old ones
+        merged = {**same.model_dump(mode="python", exclude_none=True), **ann}
+        try:
+            model = schemas.Annotation.model_validate(merged)
+        except Exception as e:                                       # noqa: BLE001
+            from pydantic import ValidationError
+            if isinstance(e, ValidationError):
+                raise ApiError(422, "invalid_annotation", "; ".join(
+                    f"{'.'.join(str(x) for x in er['loc']) or 'annotation'}: {er['msg'].removeprefix('Value error, ')}" for er in e.errors()))
+            raise
+        return model, [{"op": "set", "path": f"annotations[{same.id}].{k}", "value": v} for k, v in ann.items() if k != "match"], same.id
     existing = {a.id for a in store.annotations()}
     if req.id:
         aid = req.id
@@ -305,10 +327,16 @@ def resolved_txs(state: AppState) -> list:
     return state.snapshot().once("resolved_txs", load)
 
 
+def _with_annotation(annotations: list, new: dict) -> list:
+    """`annotations` once `new` is written: an update keeps its place (first match wins), a new one goes last."""
+    out = [new if a.get("id") == new["id"] else a for a in annotations]
+    return out if any(a.get("id") == new["id"] for a in annotations) else out + [new]
+
+
 def _annotation_effect(state: AppState, model, category: Optional[str] = None) -> dict:
     """What the new annotation really does: the classifier is run with and without it on the transactions it matches."""
     new = txmatch.ann_plain(model)
-    existing = [txmatch.ann_plain(x) for x in state.store.annotations()]
+    existing = [txmatch.ann_plain(x) for x in state.store.annotations() if x.id != model.id]   # an update replaces its old version
     match = new["match"]
 
     def keys_of(con):
@@ -316,7 +344,7 @@ def _annotation_effect(state: AppState, model, category: Optional[str] = None) -
             return list(match["tx_keys"])
         return [r[0] for r in con.execute("SELECT tx_key FROM tx_enriched WHERE merchant_key REGEXP ?", (match["merchant_key"],))]
 
-    before, after = simulate.simulate_write(state, keys_of, lambda con: None, annotations_after=R.load_annotations(state.cfg.memory_dir) + [new])
+    before, after = simulate.simulate_write(state, keys_of, lambda con: None, annotations_after=_with_annotation(R.load_annotations(state.cfg.memory_dir), new))
     target = category or new.get("category") or ""
     eff = simulate.summarise(before, after, target) if target else simulate.summarise(before, after, "")
     pv = txmatch.preview(new, existing, resolved_txs(state))
